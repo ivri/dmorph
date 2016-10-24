@@ -1,1 +1,1 @@
- ./dmorph_gpu --cnn-mem 4444 --input train --devel dev --treport 100 --dreport 3 --layers 3 --embedding 200 --part-embedding 15 --hidden 200 --lstm --sup-train
+./dmorph --cnn-mem 4444 --input train.t --devel dev.t --treport 200 --dreport 50 --layers 3 --embedding 300 --words GoogleNews-vectors-negative300.bin  --part-embedding 15 --hidden 300 --lstm --sup-train

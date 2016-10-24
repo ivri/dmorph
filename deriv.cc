@@ -22,7 +22,7 @@ using namespace boost::filesystem;
 #include <boost/archive/text_oarchive.hpp>
 
 cnn::Dict d, dc;
-int kSOS, kEOS, kSOW, kEOW;
+int kSOS, kEOS, kSOW, kEOW, kUNK;
 
 //parameters
 unsigned LAYERS = 3;
@@ -62,6 +62,7 @@ int main(int argc, char **argv)
 		("embedding,E", value<int>()->default_value(EMBEDDING_DIM), "use <num> dimensions for word embeddings")
 		("part-embedding,P", value<int>()->default_value(EMBEDDING_CHAR_DIM), "use <num> dimensions for character embeddings")
 		("hidden,h", value<int>()->default_value(HIDDEN_DIM), "use <num> dimensions for recurrent hidden states")
+		("words,w", value<string>(), "Pretrained word embeddings, EMBEDDING DIM should be the same.")
 		("gru", "use Gated Recurrent Unit (GRU) for recurrent structure; default RNN")
 		("lstm", "use Long Short Term Memory (GRU) for recurrent structure; default RNN")
 		("decode", "decode sentences in the test set")
@@ -98,7 +99,8 @@ int main_body(variables_map vm)
 
 	unsigned batch_size = 10;
 	unsigned batch_iter = 2;
-
+	unordered_map<unsigned, vector<float>> pretrained;
+	
 	kSOS = d.convert("<s>");
 	kEOS = d.convert("</s>");
 	kSOW = dc.convert("{");
@@ -120,7 +122,32 @@ int main_body(variables_map vm)
 	// ---- read training sentences
 	vector<VocabEntryPtr> training;
 	Model model;
-	if (vm.count("input")) {
+
+	if (vm.count("words")) {
+    		cerr << "Loading from " << vm["words"].as<string>() << " with" << EMBEDDING_DIM << " dimensions\n";
+    		ifstream in(vm["words"].as<string>().c_str());
+    		string line;
+    		getline(in, line);
+    		vector<float> v(EMBEDDING_DIM, 0);
+    		string word;
+		auto c = 0;
+    		while (getline(in, line)) {
+      			istringstream lin(line);
+      			lin >> word;
+      			for (unsigned i = 0; i < EMBEDDING_DIM; ++i) lin >> v[i];
+      			unsigned id = d.convert(word);
+      			pretrained[id] = v;
+			++c;
+			if (c==300000) break;
+    		}
+  	}
+
+	d.freeze();
+	d.set_unk("UNK");
+        kUNK = d.convert("UNK");
+	pretrained[kUNK] = vector<float>(EMBEDDING_DIM, 0);
+	
+	if  (vm.count("input")) {
 		if (! exists(vm["input"].as<string>())) {
 			cout << "the input file doesnt exist" << endl;
 			return 1;
@@ -128,8 +155,6 @@ int main_body(variables_map vm)
 		ReadFile(vm["input"].as<string>().c_str(), training);
 	}
 
-	d.freeze();
-	d.set_unk("UNK");
 	dc.freeze();
 
 	INPUT_VOCAB_SIZE = d.size();
@@ -170,14 +195,16 @@ int main_body(variables_map vm)
 		cerr << "%%  Character embedding dimensionality is set to " << EMBEDDING_CHAR_DIM << endl;
 
 
-		bool use_momentum = true;
+		bool use_momentum = false;
 		Trainer* sgd = nullptr;
 		if (use_momentum)
 			sgd = new MomentumSGDTrainer(&model);
 		else
 			sgd = new SimpleSGDTrainer(&model);
-		EncoderDecoder<rnn_t> lm(model, LAYERS, EMBEDDING_DIM, HIDDEN_DIM, EMBEDDING_CHAR_DIM, INPUT_VOCAB_SIZE, INPUT_LEX_SIZE);
-		sup_train<rnn_t>(training, devel, &model,  &lm, report, WRITE_EVERY_I, sgd, fname);
+		cerr << "%% Creating Encoder-Decoder ..."<<endl;
+		EncoderDecoder<rnn_t> lm(model, LAYERS, EMBEDDING_DIM, HIDDEN_DIM, EMBEDDING_CHAR_DIM, INPUT_VOCAB_SIZE, INPUT_LEX_SIZE, &pretrained);
+		cerr << "%%  Starting the training..." << endl;
+		sup_train<rnn_t>(training, devel, &model,  &lm, report, WRITE_EVERY_I, sgd, fname, dc);
 	}
 
 
@@ -201,7 +228,7 @@ int main_body(variables_map vm)
 			ReadFile(vm["test"].as<string>().c_str(), test);
 		}
 
-		run_decode<rnn_t>(test, &lm);
+		run_decode<rnn_t>(test, &lm, dc);
 	}
 
 }
