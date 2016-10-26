@@ -44,7 +44,7 @@ typedef boost::shared_ptr<VocabEntry> VocabEntryPtr;
 template <class Builder>
 struct EncoderDecoder {
 	LookupParameter p_c;
-//	LookupParameter p_t; // pretrained word embeddings 
+	//	LookupParameter p_t; // pretrained word embeddings 
 	LookupParameter p_ec;  // map input to embedding (used in fwd and rev models)
 	Parameter p_ie2h;
 	Parameter p_bie;
@@ -60,10 +60,11 @@ struct EncoderDecoder {
 	Builder base_rev_enc_builder;
 	Builder base_fwd_enc_builder;
 	unsigned layers;
-        unsigned embedding_dim;
-        unsigned hidden_dim;
-        unsigned num_init_params;
-
+	unsigned embedding_dim;
+	unsigned hidden_dim;
+	unsigned num_init_params;
+	bool single_dir = false;
+	bool nobase = false;
 
 	bool  hasNan (const vector<float> &a) {
 		for (size_t i = 0; i < a.size(); ++i) if (isnan(a[i])) return true;
@@ -76,8 +77,8 @@ struct EncoderDecoder {
 		for (size_t i = 0; i < a.size(); ++i) if (isnan(a[i])) return true;
 		return false;
 	}
- 
-	explicit EncoderDecoder(Model& model, unsigned LAYERS, unsigned INPUT_DIM, unsigned HIDDEN_DIM, unsigned INPUT_CHAR_DIM, unsigned INPUT_VOCAB_SIZE, unsigned INPUT_LEX_SIZE, const unordered_map<unsigned, vector<float>>* pretrained=0) :
+
+	explicit EncoderDecoder(Model& model, unsigned LAYERS, unsigned INPUT_DIM, unsigned HIDDEN_DIM, unsigned INPUT_CHAR_DIM, unsigned INPUT_VOCAB_SIZE, unsigned INPUT_LEX_SIZE, const unordered_map<unsigned, vector<float>>* pretrained=0, bool _single_dir=false, bool _nobase=false) :
 		dec_builder(LAYERS, INPUT_CHAR_DIM, HIDDEN_DIM, &model),
 		left_rev_enc_builder(LAYERS, INPUT_DIM, HIDDEN_DIM, &model),
 		left_fwd_enc_builder(LAYERS, INPUT_DIM, HIDDEN_DIM, &model),
@@ -85,7 +86,6 @@ struct EncoderDecoder {
 		right_fwd_enc_builder(LAYERS, INPUT_DIM, HIDDEN_DIM, &model),
 		base_rev_enc_builder(LAYERS, INPUT_CHAR_DIM, HIDDEN_DIM, &model),
 		base_fwd_enc_builder(LAYERS, INPUT_CHAR_DIM, HIDDEN_DIM, &model){
-			p_ie2h = model.add_parameters({unsigned(HIDDEN_DIM * LAYERS * 1.5), unsigned(HIDDEN_DIM * LAYERS * 6)}); //6
 			p_bie = model.add_parameters({unsigned(HIDDEN_DIM * LAYERS * 1.5)});
 			p_h2oe = model.add_parameters({unsigned(HIDDEN_DIM * LAYERS), unsigned(HIDDEN_DIM * LAYERS * 1.5)});
 			p_boe = model.add_parameters({unsigned(HIDDEN_DIM * LAYERS)});
@@ -93,18 +93,29 @@ struct EncoderDecoder {
 			p_ec = model.add_lookup_parameters(INPUT_VOCAB_SIZE, {INPUT_DIM}); 
 			p_R = model.add_parameters({INPUT_LEX_SIZE, HIDDEN_DIM});
 			p_bias = model.add_parameters({INPUT_LEX_SIZE});
-			
+
+			int concat_len = 6; //left*2+righ+2+base*2 	
 			this->layers = LAYERS;
 			this->hidden_dim = HIDDEN_DIM;
-			cerr << "%% Initializing the vectors..."<<endl;
 			if (pretrained) {
-      				for (const auto& it : *pretrained) {
-//					cerr << "Iniitializing "<< it.first << endl;	
-        				p_ec.initialize(it.first, it.second);
+				cerr << "%% Initializing the vectors..." << endl;
+				for (const auto& it : *pretrained) {
+					p_ec.initialize(it.first, it.second);
 				}
-   			 } 
-			
-	}
+			} 
+			if (_single_dir) {
+				cerr << "%% The model will be single-directed, i.e. no bidirectionality for contexts." << endl;
+				this->single_dir=true;
+				concat_len -= 2;
+			}
+
+			if (_nobase) {
+				cerr << "%% No base form is included. The model entirely relies on the context." << endl;
+				this->nobase=true;
+				concat_len -= 2;
+			}
+			p_ie2h = model.add_parameters({unsigned(HIDDEN_DIM * LAYERS * 1.5), unsigned(HIDDEN_DIM * LAYERS * concat_len)}); //6
+		}
 
 	// build graph and return Expression for total loss
 	vector<Expression> BuildGraph(const vector<int>& leftsent, const vector<int>& rightsent,const vector<int>& base, ComputationGraph& cg) {
@@ -119,23 +130,29 @@ struct EncoderDecoder {
 			if (hasNan(&i_x_t)) cerr << "Achtung ! NAN 0-1!" << endl, abort();
 			left_fwd_enc_builder.add_input(i_x_t);
 		}
-		// backward encoder for left context
-		left_rev_enc_builder.new_graph(cg);
-		left_rev_enc_builder.start_new_sequence();
-		for (int t = leftsent.size() - 1; t >= 0; --t) {
-			Expression i_x_t = lookup(cg, p_ec, leftsent[t]);
-			if (hasNan(&i_x_t)) cerr << "Achtung ! NAN 0-2!" << endl, abort();
-			left_rev_enc_builder.add_input(i_x_t);
+		if (!single_dir) {
+//			cerr << "Adding 2nd left direction..." << endl;
+			// backward encoder for left context
+			left_rev_enc_builder.new_graph(cg);
+			left_rev_enc_builder.start_new_sequence();
+			for (int t = leftsent.size() - 1; t >= 0; --t) {
+				Expression i_x_t = lookup(cg, p_ec, leftsent[t]);
+				if (hasNan(&i_x_t)) cerr << "Achtung ! NAN 0-2!" << endl, abort();
+				left_rev_enc_builder.add_input(i_x_t);
+			}
 		}
 
 		// RIGHT CONTEXT
 		// forward encoder for right context
-		right_fwd_enc_builder.new_graph(cg);
-		right_fwd_enc_builder.start_new_sequence();
-		for (unsigned t = 0; t < rightsent.size(); ++t) {
-			Expression i_x_t = lookup(cg,p_ec,rightsent[t]);
-			if (hasNan(&i_x_t)) cerr << "Achtung ! NAN 0-3!" << endl, abort();
-			right_fwd_enc_builder.add_input(i_x_t);
+		if (!single_dir) {
+//			cerr << "Adding 2nd right direction..." << endl;
+			right_fwd_enc_builder.new_graph(cg);
+			right_fwd_enc_builder.start_new_sequence();
+			for (unsigned t = 0; t < rightsent.size(); ++t) {
+				Expression i_x_t = lookup(cg,p_ec,rightsent[t]);
+				if (hasNan(&i_x_t)) cerr << "Achtung ! NAN 0-3!" << endl, abort();
+				right_fwd_enc_builder.add_input(i_x_t);
+			}
 		}
 		// backward encoder for left context
 		right_rev_enc_builder.new_graph(cg);
@@ -148,33 +165,38 @@ struct EncoderDecoder {
 
 		// CHAR-LEVEL BASE FORM 
 		// forward encoder for right context
-		base_fwd_enc_builder.new_graph(cg);
-		base_fwd_enc_builder.start_new_sequence();
-		for (unsigned t = 0; t < base.size(); ++t) {
-			Expression i_x_t = lookup(cg,p_c,base[t]);
-			if (hasNan(&i_x_t)) cerr << "Achtung ! NAN 0-5!" << endl, abort();
-			base_fwd_enc_builder.add_input(i_x_t);
+		if (!nobase) {
+//			cerr << "Adding base both directions..." << endl;
+			base_fwd_enc_builder.new_graph(cg);
+			base_fwd_enc_builder.start_new_sequence();
+			for (unsigned t = 0; t < base.size(); ++t) {
+				Expression i_x_t = lookup(cg,p_c,base[t]);
+				if (hasNan(&i_x_t)) cerr << "Achtung ! NAN 0-5!" << endl, abort();
+				base_fwd_enc_builder.add_input(i_x_t);
+			}
+			// backward encoder for left context
+			base_rev_enc_builder.new_graph(cg);
+			base_rev_enc_builder.start_new_sequence();
+			for (int t = base.size() - 1; t >= 0; --t) {
+				Expression i_x_t = lookup(cg, p_c, base[t]);
+				if (hasNan(&i_x_t)) cerr << "Achtung ! NAN 0-6!" << endl, abort();
+				base_rev_enc_builder.add_input(i_x_t);
+			}	
 		}
-		// backward encoder for left context
-		base_rev_enc_builder.new_graph(cg);
-		base_rev_enc_builder.start_new_sequence();
-		for (int t = base.size() - 1; t >= 0; --t) {
-			Expression i_x_t = lookup(cg, p_c, base[t]);
-			if (hasNan(&i_x_t)) cerr << "Achtung ! NAN 0-6!" << endl, abort();
-			base_rev_enc_builder.add_input(i_x_t);
-		}	
 
 		// encoder -> decoder transformation
 		vector<Expression> to;
-		for (auto h_l : right_fwd_enc_builder.final_h()) to.push_back(h_l);
+		if (!single_dir)
+			for (auto h_l : right_fwd_enc_builder.final_h()) to.push_back(h_l);
 		for (auto h_l : right_rev_enc_builder.final_h()) to.push_back(h_l);
 
 		for (auto h_l : left_fwd_enc_builder.final_h()) to.push_back(h_l);
-		for (auto h_l : left_rev_enc_builder.final_h()) to.push_back(h_l);
-
-		for (auto h_l : base_fwd_enc_builder.final_h()) to.push_back(h_l);
-		for (auto h_l : base_rev_enc_builder.final_h()) to.push_back(h_l);
-
+		if (!single_dir)
+			for (auto h_l : left_rev_enc_builder.final_h()) to.push_back(h_l);
+		if (!nobase) {
+			for (auto h_l : base_fwd_enc_builder.final_h()) to.push_back(h_l);
+			for (auto h_l : base_rev_enc_builder.final_h()) to.push_back(h_l);
+		}
 		Expression i_combined = concatenate(to);
 		if (hasNan(&i_combined)) cerr << "Achtung ! NAN 0-7!" << endl, abort();
 		Expression i_ie2h = parameter(cg, p_ie2h);
@@ -219,26 +241,26 @@ struct EncoderDecoder {
 		for (unsigned t = 0; t < derlen; ++t) {
 			Expression i_x_t = lookup(cg, p_c, derived[t]);
 			if (hasNan(&i_x_t)) cerr << "Achtung ! NAN 1-3 !" << endl, abort();
-			cerr << dc.convert(derived[t+1]) << "-> ";
+			cerr << dc.convert(derived[t+1]) << "->";
 			Expression i_y_t = dec_builder.add_input(i_x_t);
 			if (hasNan(&i_y_t)) cerr << "Achtung ! NAN 1-4!" << endl, abort();
 			Expression i_r_t = i_bias + i_R * i_y_t;
 			if (hasNan(&i_r_t)) cerr << "Achtung ! NAN 1-5 !" << endl, abort();
 			Expression i_ydist = log_softmax(i_r_t);
-		//	cerr << "i_r_t" << cg.get_value(i_r_t) <<"  i_ydist = " << cg.get_value(i_ydist)<< endl;
+			//	cerr << "i_r_t" << cg.get_value(i_r_t) <<"  i_ydist = " << cg.get_value(i_ydist)<< endl;
 			cg.incremental_forward();
 			auto dist = as_vector(cg.get_value(i_ydist));
 			//for (auto item = dist.begin(); item != dist.end(); ++item)
 			//  std::cout << *item << ' ';
 			auto next = std::max_element(dist.begin(), dist.end()) - dist.begin();
 			cerr << dc.convert(next)  << " ";
-		//errs.push_back(pickneglogsoftmax(i_r_t, derived[t+1]));
+			//errs.push_back(pickneglogsoftmax(i_r_t, derived[t+1]));
 			errs.push_back(pick(i_ydist,derived[t+1]));//i_ydist
 			//			cerr << " " << dc.convert(derived[t+1]) << " Error= "<<as_scalar(cg.get_value(errs[t]));
 		}
 		//		cerr << "Fin!" << endl;
 		Expression i_nerr = sum(errs);
-//		cg.incremental_forward();
+		//		cg.incremental_forward();
 		cerr <<"Err = " << cg.get_value(i_nerr)<< endl;
 		return -i_nerr;
 	}
@@ -275,9 +297,9 @@ struct EncoderDecoder {
 
 		return result;
 	}
-	
+
 	private:
-		EncoderDecoder(const EncoderDecoder &) { cerr << "Copying Enc-Dec instance" << endl; exit(1);}
+	EncoderDecoder(const EncoderDecoder &) { cerr << "Copying Enc-Dec instance" << endl; exit(1);}
 };
 /*
 // { a l i g n } ||| { a l i g n m e n t } ||| { a l i g n m e n t s } ||| <s> VIOLENT groups use rage and weapons to their advantage and sometimes terrorism PEACEFUL ||| depict pacifist and anti-war movements </s>
@@ -331,7 +353,7 @@ cerr << tlc << " lines, " <<  d.size() << " types, " << dc.size() << " chars\n" 
 }
 
  */
-template <class Builder>
+	template <class Builder>
 void sup_train(const vector<VocabEntryPtr> &training, const vector<VocabEntryPtr> &devel,Model *model,
 		EncoderDecoder<Builder> *lm, unsigned report_every_i, unsigned dev_every_i_reports, Trainer* sgd,
 		const string &fname, const cnn::Dict &dc)
@@ -364,16 +386,16 @@ void sup_train(const vector<VocabEntryPtr> &training, const vector<VocabEntryPtr
 			++si;
 			cerr << "\nsi = "<< si << " Derived: ";
 			for (std::vector<int>::const_iterator item = entry->Derived.begin(); item != entry->Derived.end(); ++item)
-                                cerr << dc.convert(*item) << ' ';
+				cerr << dc.convert(*item) << ' ';
 			cerr << " Base: ";
 			for (std::vector<int>::const_iterator item = entry->Base.begin(); item != entry->Base.end(); ++item)
-                                cerr << dc.convert(*item) << ' ';
-//			cerr << " Left: ";
-//			for (std::vector<int>::const_iterator item = entry->LeftContext.begin(); item != entry->LeftContext.end(); ++item)
-//                        	cerr << *item << ' ';
-//			cerr << " Right: ";
-//			for (std::vector<int>::const_iterator item = entry->RightContext.begin(); item != entry->RightContext.end(); ++item)
-//                                cerr << *item << ' ';
+				cerr << dc.convert(*item) << ' ';
+			//			cerr << " Left: ";
+			//			for (std::vector<int>::const_iterator item = entry->LeftContext.begin(); item != entry->LeftContext.end(); ++item)
+			//                        	cerr << *item << ' ';
+			//			cerr << " Right: ";
+			//			for (std::vector<int>::const_iterator item = entry->RightContext.begin(); item != entry->RightContext.end(); ++item)
+			//                                cerr << *item << ' ';
 			cerr << endl;
 			lm->Propagate(entry->LeftContext, entry->RightContext, entry->Base, entry->Derived, cg, dc);
 			loss += as_scalar(cg.forward());

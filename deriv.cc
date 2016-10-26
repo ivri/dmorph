@@ -66,6 +66,8 @@ int main(int argc, char **argv)
 		("gru", "use Gated Recurrent Unit (GRU) for recurrent structure; default RNN")
 		("lstm", "use Long Short Term Memory (GRU) for recurrent structure; default RNN")
 		("decode", "decode sentences in the test set")
+		("nobase", "don't include base form")
+		("singledir", "use single left and right context direction (towards central word)")
 		;
 	store(parse_command_line(argc, argv, opts), vm);
 
@@ -105,6 +107,8 @@ int main_body(variables_map vm)
 	kEOS = d.convert("</s>");
 	kSOW = dc.convert("{");
 	kEOW = dc.convert("}");
+	
+	bool nobase, singledir = false;
 
 	//----
 	if (vm.count("batch_size")) batch_size = vm["batch_size"].as<int>();
@@ -118,6 +122,9 @@ int main_body(variables_map vm)
 	if (vm.count("embedding")) EMBEDDING_DIM = vm["embedding"].as<int>();
 	if (vm.count("hidden")) HIDDEN_DIM = vm["hidden"].as<int>();
 	if (vm.count("part-embedding")) EMBEDDING_CHAR_DIM = vm["part-embedding"].as<int>();
+
+        if (vm.count("nobase")) nobase = true;
+        if (vm.count("singledir")) singledir = true;
 
 	// ---- read training sentences
 	vector<VocabEntryPtr> training;
@@ -202,14 +209,14 @@ int main_body(variables_map vm)
 		else
 			sgd = new SimpleSGDTrainer(&model);
 		cerr << "%% Creating Encoder-Decoder ..."<<endl;
-		EncoderDecoder<rnn_t> lm(model, LAYERS, EMBEDDING_DIM, HIDDEN_DIM, EMBEDDING_CHAR_DIM, INPUT_VOCAB_SIZE, INPUT_LEX_SIZE, &pretrained);
+		EncoderDecoder<rnn_t> lm(model, LAYERS, EMBEDDING_DIM, HIDDEN_DIM, EMBEDDING_CHAR_DIM, INPUT_VOCAB_SIZE, INPUT_LEX_SIZE, &pretrained, singledir, nobase);
 		cerr << "%%  Starting the training..." << endl;
 		sup_train<rnn_t>(training, devel, &model,  &lm, report, WRITE_EVERY_I, sgd, fname, dc);
 	}
 
 
 	if (vm.count("decode")) {
-		EncoderDecoder<rnn_t> lm(model, LAYERS, EMBEDDING_DIM, HIDDEN_DIM, EMBEDDING_CHAR_DIM, INPUT_VOCAB_SIZE, INPUT_LEX_SIZE);
+		EncoderDecoder<rnn_t> lm(model, LAYERS, EMBEDDING_DIM, HIDDEN_DIM, EMBEDDING_CHAR_DIM, INPUT_VOCAB_SIZE, INPUT_LEX_SIZE,0, singledir, nobase);
 
 		if (vm.count("initialise")) {
                 	cerr << "initialising the model from: " << vm["initialise"].as<string>() << endl;
@@ -268,7 +275,7 @@ void ReadFile(const char* fname, vector<VocabEntryPtr>& dataset)
 		{
 			if (token == "|||"){
 				state += 1;
-				assert(state <= 4);
+				assert(state <= 6);
 				continue;
 			}
 
@@ -277,9 +284,9 @@ void ReadFile(const char* fname, vector<VocabEntryPtr>& dataset)
 				entry->Base.push_back(dc.convert(token));
 			else if (state == 1)
 				entry->Derived.push_back(dc.convert(token));
-			else if (state == 2)   // skipping the word form
+			else if (state == 2 || state == 3 || state==4)  // skipping the word form
 				continue;
-			else if (state == 3)
+			else if (state == 5)
 				entry->LeftContext.push_back(d.convert(token));
 			else
 				entry->RightContext.push_back(d.convert(token));

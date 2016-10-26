@@ -1,1 +1,1 @@
-./dmorph --cnn-mem 4444 --input train.t --devel dev.t --treport 200 --dreport 50 --layers 3 --embedding 300 --words GoogleNews-vectors-negative300.bin  --part-embedding 15 --hidden 300 --lstm --sup-train
+./dmorph3 --cnn-mem 4444 --input dataset.uq.shuff.train --devel dataset.uq.shuff.dev --treport 200 --dreport 50 --layers 3 --embedding 300 --words GoogleNews-vectors-negative300.bin  --part-embedding 30 --hidden 300 --lstm --singledir --sup-train
