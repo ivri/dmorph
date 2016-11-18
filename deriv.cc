@@ -6,22 +6,19 @@
 #include <vector>
 #include <ctime>
 
-#include "cnn/gru.h"
+#include "dynet/gru.h"
 
 #include <boost/filesystem.hpp>
-#include <boost/shared_ptr.hpp>
 #include <boost/program_options/parsers.hpp>
 #include <boost/program_options/variables_map.hpp>
 
 using namespace std;
-using namespace cnn;
+using namespace dynet;
 using namespace boost::program_options;
 using namespace boost::filesystem;
 
-#include <boost/archive/text_iarchive.hpp>
-#include <boost/archive/text_oarchive.hpp>
 
-cnn::Dict d, dc;
+dynet::Dict d, dc;
 int kSOS, kEOS, kSOW, kEOW, kUNK;
 
 //parameters
@@ -39,7 +36,7 @@ void ReadFile(const char* fname, vector<VocabEntryPtr>& dataset);
 
 int main(int argc, char **argv)
 {
-	cnn::initialize(argc, argv);
+	dynet::initialize(argc, argv);
 
 	// command line processing
 	variables_map vm;
@@ -131,29 +128,26 @@ int main_body(variables_map vm)
 	Model model;
 
 	if (vm.count("words")) {
-    		cerr << "Loading from " << vm["words"].as<string>() << " with" << EMBEDDING_DIM << " dimensions\n";
+    		cerr << "Loading from " << vm["words"].as<string>() << " with " << EMBEDDING_DIM << " dimensions\n";
     		ifstream in(vm["words"].as<string>().c_str());
     		string line;
-    		getline(in, line);
+    	//	getline(in, line);
     		vector<float> v(EMBEDDING_DIM, 0);
     		string word;
-		auto c = 0;
     		while (getline(in, line)) {
       			istringstream lin(line);
       			lin >> word;
-      			for (unsigned i = 0; i < EMBEDDING_DIM; ++i) lin >> v[i];
+      			for (unsigned i = 0; i < EMBEDDING_DIM; ++i) lin >> v[i]; 
       			unsigned id = d.convert(word);
       			pretrained[id] = v;
-			++c;
-			if (c==300000) break;
     		}
   	}
 
 	d.freeze();
-	d.set_unk("UNK");
-        kUNK = d.convert("UNK");
-	pretrained[kUNK] = vector<float>(EMBEDDING_DIM, 0);
-	
+	d.set_unk("<UNK>");
+        kUNK = d.convert("<UNK>");
+	pretrained[kUNK] = vector<float>(EMBEDDING_DIM, 0.001);
+	pretrained[kSOS] = vector<float>(EMBEDDING_DIM, 0.001);	
 	if  (vm.count("input")) {
 		if (! exists(vm["input"].as<string>())) {
 			cout << "the input file doesnt exist" << endl;
@@ -202,16 +196,24 @@ int main_body(variables_map vm)
 		cerr << "%%  Character embedding dimensionality is set to " << EMBEDDING_CHAR_DIM << endl;
 
 
-		bool use_momentum = false;
+		bool use_momentum = true;
 		Trainer* sgd = nullptr;
+		float learning_rate = 0.001;
 		if (use_momentum)
-			sgd = new MomentumSGDTrainer(&model);
-		else
-			sgd = new SimpleSGDTrainer(&model);
-		cerr << "%% Creating Encoder-Decoder ..."<<endl;
-		EncoderDecoder<rnn_t> lm(model, LAYERS, EMBEDDING_DIM, HIDDEN_DIM, EMBEDDING_CHAR_DIM, INPUT_VOCAB_SIZE, INPUT_LEX_SIZE, &pretrained, singledir, nobase);
+			sgd = new MomentumSGDTrainer(&model, 0.001);
+		else {
+			sgd = new AdamTrainer(&model, learning_rate);
+			cerr << "%% Using AdamTrainer with " << learning_rate << " learning rate "<< endl; 
+		}//SimpleSGDTrainer(&model);
+		cerr << "%% Creating Encoder-Decoder ..." << endl;
+		EncoderDecoder<rnn_t> lm(model, LAYERS, EMBEDDING_DIM, HIDDEN_DIM, EMBEDDING_CHAR_DIM, INPUT_VOCAB_SIZE, INPUT_LEX_SIZE, vm.count("initialise") ? 0 : &pretrained, singledir, nobase);
+		 if (vm.count("initialise")) {
+                        cerr << "initialising the model from: " << vm["initialise"].as<string>() << endl;
+                        initialise(model, vm["initialise"].as<string>());
+                } 
+		
 		cerr << "%%  Starting the training..." << endl;
-		sup_train<rnn_t>(training, devel, &model,  &lm, report, WRITE_EVERY_I, sgd, fname, dc);
+		sup_train<rnn_t>(training, devel, &model,  &lm, report, WRITE_EVERY_I, sgd, fname, dc, d);
 	}
 
 
@@ -252,7 +254,7 @@ void initialise(Model &model, const string &filename)
 }
 
 
-// { a l i g n } ||| { a l i g n m e n t } ||| { a l i g n m e n t s } ||| <s> VIOLENT groups use rage and weapons to their advantage and sometimes terrorism PEACEFUL ||| depict pacifist and anti-war movements </s>
+//{ e n l a r g e } ||| { e n l a r g e m e n t } ||| { e n l a r g e m e n t } ||| VB ||| enlarge+ment ||| <s> It may lead to ||| of the cranium if hydrocephalus occurs during development . </s>
 
 void ReadFile(const char* fname, vector<VocabEntryPtr>& dataset)
 {
@@ -279,8 +281,7 @@ void ReadFile(const char* fname, vector<VocabEntryPtr>& dataset)
 				continue;
 			}
 
-
-			if (state == 0)
+			if (state == 0) 
 				entry->Base.push_back(dc.convert(token));
 			else if (state == 1)
 				entry->Derived.push_back(dc.convert(token));
