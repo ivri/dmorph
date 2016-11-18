@@ -1,1 +1,2 @@
-./dmorph3 --cnn-mem 4444 --input dataset.uq.shuff.train --devel dataset.uq.shuff.dev --treport 200 --dreport 50 --layers 3 --embedding 300 --words GoogleNews-vectors-negative300.bin  --part-embedding 30 --hidden 300 --lstm --singledir --sup-train
+export MKL_NUM_THREADS=3
+./dmorph_dynet --dynet-mem 3444 --input out.shuf.train --devel out.shuf.dev --words out.shuf.lex.vec --treport 200 --dreport 50 --layers 3 --embedding 300 --part-embedding 100 --hidden 100 --lstm --sup-train

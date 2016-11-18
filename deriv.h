@@ -309,7 +309,12 @@ Expression Propagate(const vector<int>& leftsent, const vector<int>& rightsent, 
 		//			if (isNull(&i_y_t)) cerr << "Achtung ! Null 1-4!" << endl, abort();
 		int k = (t < base.size()-2) ? t+1 : base.size()-1;
 		cerr << dc.convert(derived[t+1]) <<":" << dc.convert(base[k])<< "->";
-		Expression i_r_t = i_bias + i_R * i_y_t + i_S * oein + i_B * lookup(cg, p_c, base[k]); //MAX pooling here?
+		Expression e_ctx = i_S * oein;
+		Expression e_base = i_B * lookup(cg, p_c, base[k]);
+		Expression hs=0.5*(e_ctx+e_base);
+                Expression max=rectify(e_base-hs)+rectify(hs-e_ctx)+hs;
+
+		Expression i_r_t = i_bias + i_R * i_y_t + max;// + i_S * oei;// + i_B * lookup(cg, p_c, base[k]); //MAX pooling here?
 		//			if (hasNan(&i_r_t)) cerr << "Achtung ! NAN 1-5 !" << endl, abort();
 		//			if (isNull(&i_r_t)) cerr << "Achtung ! Null 1-5!" << endl, abort();
 		Expression i_ydist = log_softmax(i_r_t);
@@ -356,7 +361,12 @@ vector<int> Decode(const vector<int>& leftsent, const vector<int>& rightsent, co
 		Expression i_x_t = lookup(cg, p_c, next);
 		Expression i_y_t = dec_builder.add_input(i_x_t);
 		int k = (i < base.size()-2) ? i+1 : base.size()-1;
-		Expression i_r_t = i_bias + i_R * i_y_t + i_S * oein + i_B * base[k];
+		Expression e_ctx = i_S * oein;
+                Expression e_base = i_B * lookup(cg, p_c, base[k]);
+                Expression hs=0.5*(e_ctx+e_base);
+                Expression max=rectify(e_base-hs)+rectify(hs-e_ctx)+hs;
+
+		Expression i_r_t = i_bias + i_R * i_y_t + max;// i_S * oein;// + i_B * base[k];
 		Expression i_ydist = log_softmax(i_r_t);
 		cg.incremental_forward(i_ydist);
 		auto dist = as_vector(cg.get_value(i_ydist));
