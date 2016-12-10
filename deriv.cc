@@ -18,7 +18,7 @@ using namespace boost::program_options;
 using namespace boost::filesystem;
 
 
-dynet::Dict d, dc;
+dynet::Dict d, dc, dpos;
 int kSOS, kEOS, kSOW, kEOW, kUNK;
 
 //parameters
@@ -28,10 +28,11 @@ unsigned EMBEDDING_CHAR_DIM = 15;
 unsigned HIDDEN_DIM = 200;
 unsigned INPUT_VOCAB_SIZE = 0;
 unsigned INPUT_LEX_SIZE = 0;
+unsigned POS_LEX_SIZE = 0;
 
 template <class rnn_t> int main_body(variables_map vm);
 void initialise(Model &model, const string &filename);
-void ReadFile(const char* fname, vector<VocabEntryPtr>& dataset);
+void ReadFile(const char* fname, vector<VocabEntryPtr>& dataset, bool _cpos);
 
 
 int main(int argc, char **argv)
@@ -64,6 +65,8 @@ int main(int argc, char **argv)
 		("lstm", "use Long Short Term Memory (GRU) for recurrent structure; default RNN")
 		("decode", "decode sentences in the test set")
 		("nobase", "don't include base form")
+		("nocontext", "don't include context at all")
+		("cpos", "include POS of derivation")
 		("singledir", "use single left and right context direction (towards central word)")
 		;
 	store(parse_command_line(argc, argv, opts), vm);
@@ -105,7 +108,8 @@ int main_body(variables_map vm)
 	kSOW = dc.convert("{");
 	kEOW = dc.convert("}");
 	
-	bool nobase, singledir = false;
+	bool nobase = false, singledir = false, nocontext = false, cpos = false;
+	
 
 	//----
 	if (vm.count("batch_size")) batch_size = vm["batch_size"].as<int>();
@@ -121,7 +125,9 @@ int main_body(variables_map vm)
 	if (vm.count("part-embedding")) EMBEDDING_CHAR_DIM = vm["part-embedding"].as<int>();
 
         if (vm.count("nobase")) nobase = true;
+	if (vm.count("cpos")) cpos = true;
         if (vm.count("singledir")) singledir = true;
+	if (vm.count("nocontext")) nocontext = true;
 
 	// ---- read training sentences
 	vector<VocabEntryPtr> training;
@@ -153,11 +159,15 @@ int main_body(variables_map vm)
 			cout << "the input file doesnt exist" << endl;
 			return 1;
 		}
-		ReadFile(vm["input"].as<string>().c_str(), training);
+		ReadFile(vm["input"].as<string>().c_str(), training, cpos);
 	}
 
 	dc.freeze();
-
+	if (cpos) {
+		dpos.freeze(); 
+		dpos.set_unk("UNK");
+		POS_LEX_SIZE = dpos.size();
+	}
 	INPUT_VOCAB_SIZE = d.size();
 	INPUT_LEX_SIZE = dc.size();
 
@@ -169,14 +179,15 @@ int main_body(variables_map vm)
 				cout << "the input file doesnt exist" << endl;
 				return 1;
 			}
-			ReadFile(vm["devel"].as<string>().c_str(), devel);
+			ReadFile(vm["devel"].as<string>().c_str(), devel, cpos);
 		}
 
 		// ---- output vocab, corpus stats
 		cout << "%% Training has " << training.size() << " sentence pairs\n";
 		cout << "%% Development has " << devel.size() << " sentence pairs\n";
 		cout << "%% source vocab " << INPUT_VOCAB_SIZE << " unique words\n";
-
+		if (cpos) 
+			cout << "%% POS vocab " << POS_LEX_SIZE << " unique tags\n";
 		cout << "%% batch size in unsupervised learning: " << batch_size << endl;
 		cout << "%% batch max iterations in unsup learning:" << batch_iter << endl;
 
@@ -206,7 +217,7 @@ int main_body(variables_map vm)
 			cerr << "%% Using AdamTrainer with " << learning_rate << " learning rate "<< endl; 
 		}//SimpleSGDTrainer(&model);
 		cerr << "%% Creating Encoder-Decoder ..." << endl;
-		EncoderDecoder<rnn_t> lm(model, LAYERS, EMBEDDING_DIM, HIDDEN_DIM, EMBEDDING_CHAR_DIM, INPUT_VOCAB_SIZE, INPUT_LEX_SIZE, vm.count("initialise") ? 0 : &pretrained, singledir, nobase);
+		EncoderDecoder<rnn_t> lm(model, LAYERS, EMBEDDING_DIM, HIDDEN_DIM, EMBEDDING_CHAR_DIM, INPUT_VOCAB_SIZE, INPUT_LEX_SIZE, vm.count("initialise") ? 0 : &pretrained, singledir, nobase, nocontext, POS_LEX_SIZE);
 		 if (vm.count("initialise")) {
                         cerr << "initialising the model from: " << vm["initialise"].as<string>() << endl;
                         initialise(model, vm["initialise"].as<string>());
@@ -218,7 +229,7 @@ int main_body(variables_map vm)
 
 
 	if (vm.count("decode")) {
-		EncoderDecoder<rnn_t> lm(model, LAYERS, EMBEDDING_DIM, HIDDEN_DIM, EMBEDDING_CHAR_DIM, INPUT_VOCAB_SIZE, INPUT_LEX_SIZE,0, singledir, nobase);
+		EncoderDecoder<rnn_t> lm(model, LAYERS, EMBEDDING_DIM, HIDDEN_DIM, EMBEDDING_CHAR_DIM, INPUT_VOCAB_SIZE, INPUT_LEX_SIZE,0, singledir, nobase, nocontext, POS_LEX_SIZE);
 
 		if (vm.count("initialise")) {
                 	cerr << "initialising the model from: " << vm["initialise"].as<string>() << endl;
@@ -234,7 +245,7 @@ int main_body(variables_map vm)
 				cout << "the test file doesnt exist" << endl;
 				return 1;
 			}
-			ReadFile(vm["test"].as<string>().c_str(), test);
+			ReadFile(vm["test"].as<string>().c_str(), test, cpos);
 		}
 
 		run_decode<rnn_t>(test, &lm, dc);
@@ -256,7 +267,7 @@ void initialise(Model &model, const string &filename)
 
 //{ e n l a r g e } ||| { e n l a r g e m e n t } ||| { e n l a r g e m e n t } ||| VB ||| enlarge+ment ||| <s> It may lead to ||| of the cranium if hydrocephalus occurs during development . </s>
 
-void ReadFile(const char* fname, vector<VocabEntryPtr>& dataset)
+void ReadFile(const char* fname, vector<VocabEntryPtr>& dataset, bool _cpos)
 {
 	std::string line, token;
 
@@ -285,7 +296,12 @@ void ReadFile(const char* fname, vector<VocabEntryPtr>& dataset)
 				entry->Base.push_back(dc.convert(token));
 			else if (state == 1)
 				entry->Derived.push_back(dc.convert(token));
-			else if (state == 2 || state == 3 || state==4)  // skipping the word form
+			else if (state == 3) 
+				if (_cpos)
+					entry->PosTag = dpos.convert(token);
+				else
+					entry->PosTag = 0;
+			else if (state == 2 || state==4)  // skipping the word form
 				continue;
 			else if (state == 5)
 				entry->LeftContext.push_back(d.convert(token));

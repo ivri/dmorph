@@ -87,7 +87,8 @@ struct VocabEntry
 	EncodedSentence LeftContext;
 	EncodedSentence RightContext;
 	std::vector<int> Derived;
-	std::vector<int> Base; //char?
+	std::vector<int> Base; 
+	int PosTag;
 };
 
 typedef boost::shared_ptr<VocabEntry> VocabEntryPtr;
@@ -98,6 +99,8 @@ struct EncoderDecoder {
 	LookupParameter p_c;
 	//	LookupParameter p_t; // pretrained word embeddings 
 	LookupParameter p_ec;  // map input to embedding (used in fwd and rev models)
+	LookupParameter p_p; //POS tags
+	Parameter p_M; //POS matrix
 	Parameter p_ie2h;
 	Parameter p_bie;
 	Parameter p_h2oe;
@@ -119,8 +122,10 @@ struct EncoderDecoder {
 	unsigned num_init_params;
 	bool single_dir = false;
 	bool nobase = false;
+	bool nocontext = false;
+	bool pos = false;
 
-	explicit EncoderDecoder(Model& model, unsigned LAYERS, unsigned INPUT_DIM, unsigned HIDDEN_DIM, unsigned INPUT_CHAR_DIM, unsigned INPUT_VOCAB_SIZE, unsigned INPUT_LEX_SIZE, const unordered_map<unsigned, vector<float>>* pretrained=0, bool _single_dir=false, bool _nobase=false) :
+	explicit EncoderDecoder(Model& model, unsigned LAYERS, unsigned INPUT_DIM, unsigned HIDDEN_DIM, unsigned INPUT_CHAR_DIM, unsigned INPUT_VOCAB_SIZE, unsigned INPUT_LEX_SIZE, const unordered_map<unsigned, vector<float>>* pretrained=0, bool _single_dir=false, bool _nobase=false, bool _nocontext=false, unsigned POS_LEX_SIZE=0):
 		dec_builder(LAYERS, INPUT_CHAR_DIM, HIDDEN_DIM, &model),
 		left_rev_enc_builder(LAYERS, INPUT_DIM, HIDDEN_DIM, &model),
 		left_fwd_enc_builder(LAYERS, INPUT_DIM, HIDDEN_DIM, &model),
@@ -138,22 +143,36 @@ struct EncoderDecoder {
 			p_S = model.add_parameters({INPUT_LEX_SIZE, HIDDEN_DIM});
 			p_B  = model.add_parameters({INPUT_LEX_SIZE, INPUT_CHAR_DIM});
 
-
 			int concat_len = 6; //left*2+righ+2+base*2 	
 			this->layers = LAYERS;
 			this->hidden_dim = HIDDEN_DIM;
-			if (pretrained) {
-				cerr << "%% Initializing the vectors..." << endl;
-				for (const auto& it : *pretrained) {
-					p_ec.initialize(it.first, it.second);
-				}
-			} 
-
-			if (_single_dir) {
-				cerr << "%% The model will be single-directed, i.e. no bidirectionality for contexts." << endl;
-				this->single_dir=true;
-				concat_len -= 2;
+			if (_nocontext) {
+				cerr << "%% The model will have no context information at all" << endl;
+				this->nocontext=true;
+				concat_len -= 4;
 			}
+
+			else {
+
+				if (pretrained) {
+					cerr << "%% Initializing the vectors..." << endl;
+					for (const auto& it : *pretrained) {
+						p_ec.initialize(it.first, it.second);
+					}
+				}
+
+				if (_single_dir) {
+					cerr << "%% The model will be single-directed, i.e. no bidirectionality for contexts." << endl;
+					this->single_dir=true;
+					concat_len -= 2;
+				}
+			}
+			if (POS_LEX_SIZE) {
+				cerr << "%% Including derived form POS tags into the model." << endl;
+                                this->pos=true;
+				p_p = model.add_lookup_parameters(POS_LEX_SIZE, {INPUT_CHAR_DIM/2}); // FIX THE DIMS
+				p_M  = model.add_parameters({INPUT_LEX_SIZE, INPUT_CHAR_DIM/2});
+			}				
 
 			if (_nobase) {
 				cerr << "%% No base form is included. The model entirely relies on the context." << endl;
@@ -167,47 +186,48 @@ struct EncoderDecoder {
 // build graph and return Expression for total loss
 Expression BuildGraph(const vector<int>& leftsent, const vector<int>& rightsent,const vector<int>& base, ComputationGraph& cg) {
 
-	// LEFT CONTEXT
-	// forward encoder for left context
+	if (!nocontext) {
+		// LEFT CONTEXT
+		// forward encoder for left context
+		left_fwd_enc_builder.new_graph(cg);
+		left_fwd_enc_builder.start_new_sequence();
+		for (unsigned t = 0; t < leftsent.size(); ++t) {
+			Expression i_x_t = const_lookup(cg,p_ec,leftsent[t]);
+			if (hasNan(&i_x_t)) cerr << "Achtung ! NAN 0-1!" << endl, abort();
+			left_fwd_enc_builder.add_input(i_x_t);
+		}
+		if (!single_dir) {
+			// backward encoder for left context
+			left_rev_enc_builder.new_graph(cg);
+			left_rev_enc_builder.start_new_sequence();
+			for (int t = leftsent.size() - 1; t >= 0; --t) {
+				Expression i_x_t = const_lookup(cg, p_ec, leftsent[t]);
+				if (hasNan(&i_x_t)) cerr << "Achtung ! NAN 0-2!" << endl, abort();
+				left_rev_enc_builder.add_input(i_x_t);
+			}
+		}
 
-	left_fwd_enc_builder.new_graph(cg);
-	left_fwd_enc_builder.start_new_sequence();
-	for (unsigned t = 0; t < leftsent.size(); ++t) {
-		Expression i_x_t = const_lookup(cg,p_ec,leftsent[t]);
-		if (hasNan(&i_x_t)) cerr << "Achtung ! NAN 0-1!" << endl, abort();
-		left_fwd_enc_builder.add_input(i_x_t);
-	}
-	if (!single_dir) {
+		// RIGHT CONTEXT
+		// forward encoder for right context
+		if (!single_dir) {
+			right_fwd_enc_builder.new_graph(cg);
+			right_fwd_enc_builder.start_new_sequence();
+			for (unsigned t = 0; t < rightsent.size(); ++t) {
+				Expression i_x_t = const_lookup(cg,p_ec,rightsent[t]);
+				if (hasNan(&i_x_t)) cerr << "Achtung ! NAN 0-3!" << endl, abort();
+				//if (isNull(&i_x_t)) cerr << "Achtung ! Null 0-3!" << endl, abort();
+				right_fwd_enc_builder.add_input(i_x_t);
+			}
+		}
 		// backward encoder for left context
-		left_rev_enc_builder.new_graph(cg);
-		left_rev_enc_builder.start_new_sequence();
-		for (int t = leftsent.size() - 1; t >= 0; --t) {
-			Expression i_x_t = const_lookup(cg, p_ec, leftsent[t]);
-			if (hasNan(&i_x_t)) cerr << "Achtung ! NAN 0-2!" << endl, abort();
-			left_rev_enc_builder.add_input(i_x_t);
+		right_rev_enc_builder.new_graph(cg);
+		right_rev_enc_builder.start_new_sequence();
+		for (int t = rightsent.size() - 1; t >= 0; --t) {
+			Expression i_x_t = const_lookup(cg, p_ec, rightsent[t]);
+			if (hasNan(&i_x_t)) cerr << "Achtung ! NAN 0-4!" << endl, abort();
+			// 	if (isNull(&i_x_t)) cerr << "Achtung ! Null 0-4!" << endl, abort();
+			right_rev_enc_builder.add_input(i_x_t);
 		}
-	}
-
-	// RIGHT CONTEXT
-	// forward encoder for right context
-	if (!single_dir) {
-		right_fwd_enc_builder.new_graph(cg);
-		right_fwd_enc_builder.start_new_sequence();
-		for (unsigned t = 0; t < rightsent.size(); ++t) {
-			Expression i_x_t = const_lookup(cg,p_ec,rightsent[t]);
-			if (hasNan(&i_x_t)) cerr << "Achtung ! NAN 0-3!" << endl, abort();
-			//if (isNull(&i_x_t)) cerr << "Achtung ! Null 0-3!" << endl, abort();
-			right_fwd_enc_builder.add_input(i_x_t);
-		}
-	}
-	// backward encoder for left context
-	right_rev_enc_builder.new_graph(cg);
-	right_rev_enc_builder.start_new_sequence();
-	for (int t = rightsent.size() - 1; t >= 0; --t) {
-		Expression i_x_t = const_lookup(cg, p_ec, rightsent[t]);
-		if (hasNan(&i_x_t)) cerr << "Achtung ! NAN 0-4!" << endl, abort();
-		// 	if (isNull(&i_x_t)) cerr << "Achtung ! Null 0-4!" << endl, abort();
-		right_rev_enc_builder.add_input(i_x_t);
 	}
 
 	// CHAR-LEVEL BASE FORM 
@@ -235,41 +255,34 @@ Expression BuildGraph(const vector<int>& leftsent, const vector<int>& rightsent,
 
 	// encoder -> decoder transformation
 	vector<Expression> to;
-	if (!single_dir)
-		for (auto h_l : right_fwd_enc_builder.final_h()) to.push_back(h_l);
-	for (auto h_l : right_rev_enc_builder.final_h()) to.push_back(h_l);
+	if (!nocontext) {
+		if (!single_dir)
+			for (auto h_l : right_fwd_enc_builder.final_h()) to.push_back(h_l);
+		for (auto h_l : right_rev_enc_builder.final_h()) to.push_back(h_l);
 
-	for (auto h_l : left_fwd_enc_builder.final_h()) to.push_back(h_l);
-	if (!single_dir)
-		for (auto h_l : left_rev_enc_builder.final_h()) to.push_back(h_l);
+		for (auto h_l : left_fwd_enc_builder.final_h()) to.push_back(h_l);
+		if (!single_dir)
+			for (auto h_l : left_rev_enc_builder.final_h()) to.push_back(h_l);
+	}
 	if (!nobase) {
-		//			cerr << "  Adding base"<< endl;
 		for (auto h_l : base_fwd_enc_builder.final_h()) to.push_back(h_l);
 		for (auto h_l : base_rev_enc_builder.final_h()) to.push_back(h_l);
 	}
 	Expression i_combined = concatenate(to);
 	if (hasNan(&i_combined)) cerr << "Achtung ! NAN 0-7!" << endl, abort();
-	//		if (isNull(&i_combined)) cerr << "Achtung ! Null 0-7!" << endl, abort();
 
 	Expression i_ie2h = parameter(cg, p_ie2h);
 	Expression i_bie = parameter(cg, p_bie);
 	Expression i_t = i_bie + i_ie2h * i_combined;
 	if (hasNan(&i_t)) cerr << "Achtung ! NAN 0-8!" << endl, abort();
-	//		if (isNull(&i_t)) cerr << "Achtung ! Null 0-8!" << endl, abort();
 	Expression i_h = rectify(i_t);//rectify(i_t); //replace with tanh?
-	//		LOLCAT(i_h);
 	if (hasNan(&i_h)) cerr << "Achtung ! NAN 0-9!" << endl, abort();
-	//		if (isNull(&i_h)) cerr << "Achtung ! Null 0-9!" << endl, abort();
 	Expression i_h2oe = parameter(cg,p_h2oe);
 	if (hasNan(&i_h2oe)) cerr << "Achtung ! NAN 0-10!" << endl, abort();
-	//		if (isNull(&i_h2oe)) cerr << "Achtung ! Null 0-10!" << endl, abort();
 	Expression i_boe = parameter(cg,p_boe);
 	if (hasNan(&i_boe)) cerr << "Achtung ! NAN 0-11!" << endl, abort();
-	//		if (isNull(&i_boe)) cerr << "Achtung ! Null 0-11!" << endl, abort();
 	Expression i_nc = i_boe + i_h2oe * i_h;
 	if (hasNan(&i_nc)) cerr << "Achtung ! NAN 0-12!" << endl, abort();
-	//		if (isNull(&i_nc)) cerr << "Achtung ! Null 0-12!" << endl, abort();
-	//		LOLCAT(i_nc);
 	//		vector<Expression> oein1, oein2, oein;
 	//		for (unsigned i = 0; i < layers; ++i) {
 	//			oein1.push_back(pickrange(i_nc, i * hidden_dim, (i + 1) * hidden_dim));
@@ -283,7 +296,7 @@ Expression BuildGraph(const vector<int>& leftsent, const vector<int>& rightsent,
 	return i_nc;
 }
 
-Expression Propagate(const vector<int>& leftsent, const vector<int>& rightsent, const vector<int>& base, const vector<int>& derived, ComputationGraph& cg, const dynet::Dict &dc) {
+Expression Propagate(const vector<int>& leftsent, const vector<int>& rightsent, const vector<int>& base, const vector<int>& derived, ComputationGraph& cg, const dynet::Dict &dc, const int _pos = 0){
 
 	Expression oein = BuildGraph(leftsent, rightsent, base, cg);
 	dec_builder.new_graph(cg);
@@ -293,6 +306,12 @@ Expression Propagate(const vector<int>& leftsent, const vector<int>& rightsent, 
 	Expression i_R = parameter(cg,p_R);
 	Expression i_S = parameter(cg,p_S);
 	Expression i_B = parameter(cg, p_B);
+	Expression i_pos;
+	if (this->pos) {
+		Expression i_M = parameter(cg, p_M);
+		Expression i_p = lookup(cg, p_p, _pos);
+		i_pos = i_M * i_p;
+	}
 	//		if (hasNan(&i_R)) cerr << "Achtung ! NAN 1-0!" << endl, abort();
 	//		if (isNull(&i_R)) cerr << "Achtung ! Null 1-0!" << endl, abort();
 	Expression i_bias = parameter(cg,p_bias);
@@ -303,36 +322,27 @@ Expression Propagate(const vector<int>& leftsent, const vector<int>& rightsent, 
 	for (unsigned t = 0; t < derlen; ++t) {
 		Expression i_x_t = lookup(cg, p_c, derived[t]);
 		if (hasNan(&i_x_t)) cerr << "Achtung ! NAN 1-3 !" << endl, abort();
-		//			 if (isNull(&i_x_t)) cerr << "Achtung ! Null 1-3!" << endl, abort();
 		Expression i_y_t = dec_builder.add_input(i_x_t);
 		if (hasNan(&i_y_t)) cerr << "Achtung ! NAN 1-4!" << endl, abort();
-		//			if (isNull(&i_y_t)) cerr << "Achtung ! Null 1-4!" << endl, abort();
 		int k = (t < base.size()-2) ? t+1 : base.size()-1;
 		cerr << dc.convert(derived[t+1]) <<":" << dc.convert(base[k])<< "->";
+		// max 
 		Expression e_ctx = i_S * oein;
 		Expression e_base = i_B * lookup(cg, p_c, base[k]);
 		Expression hs=0.5*(e_ctx+e_base);
-                Expression max=rectify(e_base-hs)+rectify(hs-e_ctx)+hs;
-
+		Expression max=rectify(e_base-hs)+rectify(hs-e_ctx)+hs;
+		// eomax : i_R: INPUT_LEX_SIZE*HIDDEN_DIM
 		Expression i_r_t = i_bias + i_R * i_y_t + max;// + i_S * oei;// + i_B * lookup(cg, p_c, base[k]); //MAX pooling here?
-		//			if (hasNan(&i_r_t)) cerr << "Achtung ! NAN 1-5 !" << endl, abort();
-		//			if (isNull(&i_r_t)) cerr << "Achtung ! Null 1-5!" << endl, abort();
-		Expression i_ydist = log_softmax(i_r_t);
-		//	cerr << "i_r_t" << cg.get_value(i_r_t) <<"  i_ydist = " << cg.get_value(i_ydist)<< endl;
+		Expression i_ydist = log_softmax((this->pos) ? i_r_t + i_pos : i_r_t);
 		cg.incremental_forward(i_ydist);
 		auto dist = as_vector(cg.get_value(i_ydist));
-		//for (auto item = dist.begin(); item != dist.end(); ++item)
-		//  std::cout << *item << ' ';
 		auto next = std::max_element(dist.begin(), dist.end()) - dist.begin();
 		cerr << dc.convert(next)  << " ";
 		if (((next == 1) && (derived[t+1]!=1)) || ((next!=1) && (derived[t+1]==1))) //EOW
 			errs.push_back(3*pick(i_ydist,derived[t+1]));
-		//errs.push_back(pickneglogsoftmax(i_r_t, derived[t+1]));
 		else
 			errs.push_back(pick(i_ydist,derived[t+1]));//i_ydist
-		//			cerr << " " << dc.convert(derived[t+1]) << " Error= "<<as_scalar(cg.get_value(errs[t]));
 	}
-	//		cerr << "Fin!" << endl;
 	Expression i_nerr = sum(errs);
 	//		cg.incremental_forward();
 	cerr <<"Err = " << cg.get_value(i_nerr)<< endl;
@@ -341,33 +351,39 @@ Expression Propagate(const vector<int>& leftsent, const vector<int>& rightsent, 
 
 
 // build graph and return Expression for total loss
-vector<int> Decode(const vector<int>& leftsent, const vector<int>& rightsent, const vector<int>& base, ComputationGraph& cg) {
+vector<int> Decode(const vector<int>& leftsent, const vector<int>& rightsent, const vector<int>& base, ComputationGraph& cg, const int _pos=0) {
 
 	Expression oein = BuildGraph(leftsent, rightsent, base, cg);
 	dec_builder.new_graph(cg);
 	dec_builder.start_new_sequence();
 
-	//dec_builder.start_new_sequence(oein);
 	int next = 0;//kSOW;
 	// decoder
 	Expression i_R = parameter(cg,p_R);
 	Expression i_S = parameter(cg,p_S);
 	Expression i_bias = parameter(cg,p_bias);
 	Expression i_B = parameter(cg, p_B);
+ 	Expression i_pos;
+        if (this->pos) {
+		cerr << "Getting POS embedding" << endl;
+                Expression i_M = parameter(cg, p_M);
+                Expression i_p = lookup(cg, p_p, _pos);
+                i_pos = i_M * i_p;
+        }
+	
 	vector<int> result;
 	int i = 0;
-	//		cout << "=====================" << endl;
 	do {
 		Expression i_x_t = lookup(cg, p_c, next);
 		Expression i_y_t = dec_builder.add_input(i_x_t);
 		int k = (i < base.size()-2) ? i+1 : base.size()-1;
 		Expression e_ctx = i_S * oein;
-                Expression e_base = i_B * lookup(cg, p_c, base[k]);
-                Expression hs=0.5*(e_ctx+e_base);
-                Expression max=rectify(e_base-hs)+rectify(hs-e_ctx)+hs;
+		Expression e_base = i_B * lookup(cg, p_c, base[k]);
+		Expression hs=0.5*(e_ctx+e_base);
+		Expression max=rectify(e_base-hs)+rectify(hs-e_ctx)+hs;
 
 		Expression i_r_t = i_bias + i_R * i_y_t + max;// i_S * oein;// + i_B * base[k];
-		Expression i_ydist = log_softmax(i_r_t);
+		Expression i_ydist = log_softmax((this->pos) ? i_r_t + i_pos : i_r_t);
 		cg.incremental_forward(i_ydist);
 		auto dist = as_vector(cg.get_value(i_ydist));
 		//	auto dist = as_vector(cg.incremental_forward());
@@ -376,7 +392,6 @@ vector<int> Decode(const vector<int>& leftsent, const vector<int>& rightsent, co
 		//                                std::cout << *item << ' ';
 		//			cout << "\nnext = "<< dc.convert(next) << "  i=" << i << endl;
 		result.push_back(next);
-		//	errs.push_back(pick(dist,derived[t+1]));
 		++i;
 	} 
 	while ((next != 1) && (i != 30));//kEOW );//&& i != 20); //EOW
@@ -418,12 +433,6 @@ void sup_train(const vector<VocabEntryPtr> &training, const vector<VocabEntryPtr
 			auto entry = training[order[si]];
 			chars += entry->Derived.size() - 1;
 			++si;
-			//cerr << "\nLEFT CNTX: ";
-			//for (std::vector<int>::const_iterator item = entry->LeftContext.begin(); item != entry->LeftContext.end(); ++item)
-			//        cerr << d.convert(*item) << ' ';
-			//cerr << "\nRIGHT CNTX: ";
-			//for (std::vector<int>::const_iterator item = entry->RightContext.begin(); item != entry->RightContext.end(); ++item)
-			//        cerr << d.convert(*item) << ' ';
 
 			cerr << "\nsi = "<< si << " Derived: ";
 			for (std::vector<int>::const_iterator item = entry->Derived.begin(); item != entry->Derived.end(); ++item)
@@ -431,14 +440,7 @@ void sup_train(const vector<VocabEntryPtr> &training, const vector<VocabEntryPtr
 			cerr << " Base: ";
 			for (std::vector<int>::const_iterator item = entry->Base.begin(); item != entry->Base.end(); ++item)
 				cerr << dc.convert(*item) << ' ';
-			//			cerr << " Left: ";
-			//			for (std::vector<int>::const_iterator item = entry->LeftContext.begin(); item != entry->LeftContext.end(); ++item)
-			//                        	cerr << *item << ' ';
-			//			cerr << " Right: ";
-			//			for (std::vector<int>::const_iterator item = entry->RightContext.begin(); item != entry->RightContext.end(); ++item)
-			//                                cerr << *item << ' ';
-			//	cerr << endl;
-			Expression lexp = lm->Propagate(entry->LeftContext, entry->RightContext, entry->Base, entry->Derived, cg, dc);
+			Expression lexp = lm->Propagate(entry->LeftContext, entry->RightContext, entry->Base, entry->Derived, cg, dc, (lm->pos) ? entry->PosTag : 0);
 			loss += as_scalar(cg.forward(lexp));
 			cg.backward(lexp);
 			sgd->update();
@@ -452,7 +454,6 @@ void sup_train(const vector<VocabEntryPtr> &training, const vector<VocabEntryPtr
 #if 0
 		lm.RandomSample();
 #endif
-
 		// show score on dev data?
 		report++;
 		if (report % dev_every_i_reports == 0) {
@@ -461,7 +462,7 @@ void sup_train(const vector<VocabEntryPtr> &training, const vector<VocabEntryPtr
 			int dchars = 0;
 			for (auto entry : devel) {
 				ComputationGraph cg;
-				Expression lexp = lm->Propagate(entry->LeftContext, entry->RightContext, entry->Base, entry->Derived, cg, dc);
+				Expression lexp = lm->Propagate(entry->LeftContext, entry->RightContext, entry->Base, entry->Derived, cg, dc,(lm->pos) ? entry->PosTag : 0);
 				//					for (std::vector<int>::const_iterator item = entry->Base.begin(); item != entry->Base.end(); ++item)
 				//		                                std::cout << dc.convert(*item) << ',';
 
@@ -490,14 +491,9 @@ void run_decode(const vector<VocabEntryPtr> &test, EncoderDecoder<Builder> *lm,c
 		for (std::vector<int>::const_iterator item = entry->Derived.begin(); item != entry->Derived.end(); ++item)
 			std::cout << dc.convert(*item) << ' ';//dc.convert(*item) << ' ';
 		std::cout << "|||" ;
-		// loss += as_scalar(cg.forward());
-		// chars += entry->Derived.size() - 1;
-		std::vector<int> res = lm->Decode(entry->LeftContext, entry->RightContext, entry->Base, cg);
-		//cg.forward();
-		//chars += entry->Derived.size() - 1;
+		std::vector<int> res = lm->Decode(entry->LeftContext, entry->RightContext, entry->Base, cg, (entry->PosTag) ? entry->PosTag : 0);
 		for (std::vector<int>::const_iterator item = res.begin(); item != res.end(); ++item)
 			std::cout << dc.convert(*item) << ' ';//dc.convert(*item) << ' '; FIXX
-		//cerr << " E = " << (loss / chars) << " ppl=" << exp(loss / chars) << ' ';
 	}
 }
 
